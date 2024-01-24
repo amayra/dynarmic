@@ -12,6 +12,22 @@
 namespace biscuit {
 
 /**
+ * Defines the set of features that a particular assembler instance
+ * would like to assemble for.
+ *
+ * This allows for assertions and extra logic checking to be done.
+ *
+ * It can also affect various behaviors as well. e.g. LI, shifts, etc
+ * will take these into account to adjust for emission on different
+ * environments transparently.
+ */
+enum class ArchFeature : uint32_t {
+    RV32,  //< 32-bit RISC-V
+    RV64,  //< 64-bit RISC-V
+    RV128, //< 128-bit RISC-V
+};
+
+/**
  * Code generator for RISC-V code.
  *
  * User code may inherit from this in order to make use of
@@ -27,6 +43,8 @@ public:
      * @param capacity The capacity for the underlying code buffer in bytes.
      *                 If no capacity is specified, then the underlying buffer
      *                 will be 4KB in size.
+     *
+     * @note Will assume to be assembling for RV64 unless changed.
      */
     [[nodiscard]] explicit Assembler(size_t capacity = CodeBuffer::default_capacity);
 
@@ -35,6 +53,7 @@ public:
      *
      * @param buffer   A non-null pointer to an allocated buffer of size `capacity`.
      * @param capacity The capacity of the memory pointed to by `buffer`.
+     * @param features Architectural features to make the assembler aware of.
      *
      * @pre The given memory buffer must not be null.
      * @pre The given memory buffer must be at minimum `capacity` bytes in size.
@@ -42,7 +61,8 @@ public:
      * @note The caller is responsible for managing the lifetime of the given memory.
      *       CodeBuffer will *not* free the memory once it goes out of scope.
      */
-    [[nodiscard]] explicit Assembler(uint8_t* buffer, size_t capacity);
+    [[nodiscard]] explicit Assembler(uint8_t* buffer, size_t capacity,
+                                     ArchFeature features = ArchFeature::RV64);
 
     // Copy constructor and assignment.
     Assembler(const Assembler&) = delete;
@@ -54,6 +74,16 @@ public:
 
     // Destructor
     virtual ~Assembler();
+
+    /**
+     * Tells the assembler what features to take into account.
+     *
+     * Will alter how some code is emitted and also enforce asserts suitable
+     * for those particular features.
+     */
+    void SetArchFeatures(ArchFeature features) noexcept {
+        m_features = features;
+    }
 
     /// Gets the underlying code buffer being managed by this assembler.
     CodeBuffer& GetCodeBuffer();
@@ -177,7 +207,7 @@ public:
     void LBU(GPR rd, int32_t imm, GPR rs) noexcept;
     void LH(GPR rd, int32_t imm, GPR rs) noexcept;
     void LHU(GPR rd, int32_t imm, GPR rs) noexcept;
-    void LI(GPR rd, uint32_t imm) noexcept;
+    void LI(GPR rd, uint64_t imm) noexcept;
     void LUI(GPR rd, uint32_t imm) noexcept;
     void LW(GPR rd, int32_t imm, GPR rs) noexcept;
 
@@ -230,13 +260,6 @@ public:
     void LWU(GPR rd, int32_t imm, GPR rs) noexcept;
     void SD(GPR rs2, int32_t imm, GPR rs1) noexcept;
 
-    // NOTE: Perhaps we should coalesce this into the 32-bit variant?
-    //       Keeping them separated allows asserts for catching
-    //       out of range shifts.
-    void SRAI64(GPR rd, GPR rs, uint32_t shift) noexcept;
-    void SLLI64(GPR rd, GPR rs, uint32_t shift) noexcept;
-    void SRLI64(GPR rd, GPR rs, uint32_t shift) noexcept;
-
     void SLLIW(GPR rd, GPR rs, uint32_t shift) noexcept;
     void SRAIW(GPR rd, GPR rs, uint32_t shift) noexcept;
     void SRLIW(GPR rd, GPR rs, uint32_t shift) noexcept;
@@ -245,6 +268,28 @@ public:
     void SRAW(GPR rd, GPR lhs, GPR rhs) noexcept;
     void SRLW(GPR rd, GPR lhs, GPR rhs) noexcept;
     void SUBW(GPR rd, GPR lhs, GPR rhs) noexcept;
+
+    // Zawrs Extension Instructions
+    void WRS_NTO() noexcept;
+    void WRS_STO() noexcept;
+
+    // Zacas Extension Instructions
+    //
+    // NOTE: If targeting RV32 and using AMOCAS.D, rd and rs2 must be even-numbered
+    //       registers, since they both indicate a register pair.
+    //
+    //       On RV64, even and odd numbered registers can be used,
+    //
+    //       On both RV32 and RV64, AMOCAS.Q requires rd and rs2 to be even-numbered
+    //       since it also treats them like their own register pairs.
+
+    void AMOCAS_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept;
+    void AMOCAS_Q(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept;
+    void AMOCAS_W(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept;
+
+    // Zicond Extension Instructions
+    void CZERO_EQZ(GPR rd, GPR value, GPR condition) noexcept;
+    void CZERO_NEZ(GPR rd, GPR value, GPR condition) noexcept;
 
     // Zicsr Extension Instructions
 
@@ -516,7 +561,57 @@ public:
     void FCVT_H_L(FPR rd, GPR rs1, RMode rmode = RMode::DYN) noexcept;
     void FCVT_H_LU(FPR rd, GPR rs1, RMode rmode = RMode::DYN) noexcept;
 
-    // RVB Extension Instructions
+    // Zfa Extension Instructions
+
+    void FLI_D(FPR rd, double value) noexcept;
+    void FLI_H(FPR rd, double value) noexcept;
+    void FLI_S(FPR rd, double value) noexcept;
+
+    void FMINM_D(FPR rd, FPR rs1, FPR rs2) noexcept;
+    void FMINM_H(FPR rd, FPR rs1, FPR rs2) noexcept;
+    void FMINM_Q(FPR rd, FPR rs1, FPR rs2) noexcept;
+    void FMINM_S(FPR rd, FPR rs1, FPR rs2) noexcept;
+
+    void FMAXM_D(FPR rd, FPR rs1, FPR rs2) noexcept;
+    void FMAXM_H(FPR rd, FPR rs1, FPR rs2) noexcept;
+    void FMAXM_Q(FPR rd, FPR rs1, FPR rs2) noexcept;
+    void FMAXM_S(FPR rd, FPR rs1, FPR rs2) noexcept;
+
+    void FROUND_D(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+    void FROUND_H(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+    void FROUND_Q(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+    void FROUND_S(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+
+    void FROUNDNX_D(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+    void FROUNDNX_H(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+    void FROUNDNX_Q(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+    void FROUNDNX_S(FPR rd, FPR rs1, RMode rmode = RMode::DYN) noexcept;
+
+    void FCVTMOD_W_D(GPR rd, FPR rs1) noexcept;
+
+    void FMVH_X_D(GPR rd, FPR rs1) noexcept;
+    void FMVH_X_Q(GPR rd, FPR rs1) noexcept;
+    void FMVP_D_X(FPR rd, GPR rs1, GPR rs2) noexcept;
+    void FMVP_Q_X(FPR rd, GPR rs1, GPR rs2) noexcept;
+
+    void FLEQ_D(GPR rd, FPR rs1, FPR rs2) noexcept;
+    void FLTQ_D(GPR rd, FPR rs1, FPR rs2) noexcept;
+
+    void FLEQ_H(GPR rd, FPR rs1, FPR rs2) noexcept;
+    void FLTQ_H(GPR rd, FPR rs1, FPR rs2) noexcept;
+
+    void FLEQ_Q(GPR rd, FPR rs1, FPR rs2) noexcept;
+    void FLTQ_Q(GPR rd, FPR rs1, FPR rs2) noexcept;
+
+    void FLEQ_S(GPR rd, FPR rs1, FPR rs2) noexcept;
+    void FLTQ_S(GPR rd, FPR rs1, FPR rs2) noexcept;
+
+    // Zfbfmin Extension Instructions
+
+    void FCVT_BF16_S(FPR rd, FPR rs, RMode rmode = RMode::DYN) noexcept;
+    void FCVT_S_BF16(FPR rd, FPR rs, RMode rmode = RMode::DYN) noexcept;
+
+    // RVB Extension Instructions (plus scalar crypto bit operations)
 
     void ADDUW(GPR rd, GPR rs1, GPR rs2) noexcept;
     void ANDN(GPR rd, GPR rs1, GPR rs2) noexcept;
@@ -526,6 +621,7 @@ public:
     void BEXTI(GPR rd, GPR rs, uint32_t bit) noexcept;
     void BINV(GPR rd, GPR rs1, GPR rs2) noexcept;
     void BINVI(GPR rd, GPR rs, uint32_t bit) noexcept;
+    void BREV8(GPR rd, GPR rs) noexcept;
     void BSET(GPR rd, GPR rs1, GPR rs2) noexcept;
     void BSETI(GPR rd, GPR rs, uint32_t bit) noexcept;
     void CLMUL(GPR rd, GPR rs1, GPR rs2) noexcept;
@@ -546,9 +642,7 @@ public:
     void PACK(GPR rd, GPR rs1, GPR rs2) noexcept;
     void PACKH(GPR rd, GPR rs1, GPR rs2) noexcept;
     void PACKW(GPR rd, GPR rs1, GPR rs2) noexcept;
-    void REV8_32(GPR rd, GPR rs) noexcept;
-    void REV8_64(GPR rd, GPR rs) noexcept;
-    void REV_B(GPR rd, GPR rs) noexcept;
+    void REV8(GPR rd, GPR rs) noexcept;
     void ROL(GPR rd, GPR rs1, GPR rs2) noexcept;
     void ROLW(GPR rd, GPR rs1, GPR rs2) noexcept;
     void ROR(GPR rd, GPR rs1, GPR rs2) noexcept;
@@ -566,10 +660,9 @@ public:
     void SLLIUW(GPR rd, GPR rs, uint32_t shift_amount) noexcept;
     void UNZIP(GPR rd, GPR rs) noexcept;
     void XNOR(GPR rd, GPR rs1, GPR rs2) noexcept;
-    void XPERMB(GPR rd, GPR rs1, GPR rs2) noexcept;
-    void XPERMN(GPR rd, GPR rs1, GPR rs2) noexcept;
-    void ZEXTH_32(GPR rd, GPR rs) noexcept;
-    void ZEXTH_64(GPR rd, GPR rs) noexcept;
+    void XPERM4(GPR rd, GPR rs1, GPR rs2) noexcept;
+    void XPERM8(GPR rd, GPR rs1, GPR rs2) noexcept;
+    void ZEXTH(GPR rd, GPR rs) noexcept;
     void ZEXTW(GPR rd, GPR rs) noexcept;
     void ZIP(GPR rd, GPR rs) noexcept;
 
@@ -658,6 +751,34 @@ public:
     void C_SWSP(GPR rs, uint32_t imm) noexcept;
     void C_UNDEF() noexcept;
     void C_XOR(GPR rd, GPR rs) noexcept;
+
+    // Zc Extension Instructions
+
+    void C_LBU(GPR rd, uint32_t uimm, GPR rs) noexcept;
+    void C_LH(GPR rd, uint32_t uimm, GPR rs) noexcept;
+    void C_LHU(GPR rd, uint32_t uimm, GPR rs) noexcept;
+    void C_SB(GPR rs2, uint32_t uimm, GPR rs1) noexcept;
+    void C_SH(GPR rs2, uint32_t uimm, GPR rs1) noexcept;
+
+    void C_SEXT_B(GPR rd) noexcept;
+    void C_SEXT_H(GPR rd) noexcept;
+    void C_ZEXT_B(GPR rd) noexcept;
+    void C_ZEXT_H(GPR rd) noexcept;
+    void C_ZEXT_W(GPR rd) noexcept;
+
+    void C_MUL(GPR rsd, GPR rs2) noexcept;
+    void C_NOT(GPR rd) noexcept;
+
+    void CM_MVA01S(GPR r1s, GPR r2s) noexcept;
+    void CM_MVSA01(GPR r1s, GPR r2s) noexcept;
+
+    void CM_POP(PushPopList reg_list, int32_t stack_adj) noexcept;
+    void CM_POPRET(PushPopList reg_list, int32_t stack_adj) noexcept;
+    void CM_POPRETZ(PushPopList reg_list, int32_t stack_adj) noexcept;
+    void CM_PUSH(PushPopList reg_list, int32_t stack_adj) noexcept;
+
+    void CM_JALT(uint32_t index) noexcept;
+    void CM_JT(uint32_t index) noexcept;
 
     // Cache Management Operation Extension Instructions
 
@@ -1266,6 +1387,75 @@ public:
     void VSETVL(GPR rd, GPR rs1, GPR rs2) noexcept;
     void VSETVLI(GPR rd, GPR rs, SEW sew, LMUL lmul = LMUL::M1, VTA vta = VTA::No, VMA vma = VMA::No) noexcept;
 
+    // Vector Cryptography Instructions
+
+    void VANDN(Vec vd, Vec vs2, Vec vs1, VecMask mask = VecMask::No) noexcept;
+    void VANDN(Vec vd, Vec vs2, GPR rs1, VecMask mask = VecMask::No) noexcept;
+
+    void VBREV(Vec vd, Vec vs2, VecMask mask = VecMask::No) noexcept;
+    void VBREV8(Vec vd, Vec vs2, VecMask mask = VecMask::No) noexcept;
+    void VREV8(Vec vd, Vec vs2, VecMask mask = VecMask::No) noexcept;
+
+    void VCLZ(Vec vd, Vec vs2, VecMask mask = VecMask::No) noexcept;
+    void VCTZ(Vec vd, Vec vs2, VecMask mask = VecMask::No) noexcept;
+    void VCPOP(Vec vd, Vec vs2, VecMask mask = VecMask::No) noexcept;
+
+    void VROL(Vec vd, Vec vs2, Vec vs1, VecMask mask = VecMask::No) noexcept;
+    void VROL(Vec vd, Vec vs2, GPR rs1, VecMask mask = VecMask::No) noexcept;
+
+    void VROR(Vec vd, Vec vs2, Vec vs1, VecMask mask = VecMask::No) noexcept;
+    void VROR(Vec vd, Vec vs2, GPR rs1, VecMask mask = VecMask::No) noexcept;
+    void VROR(Vec vd, Vec vs2, uint32_t uimm, VecMask mask = VecMask::No) noexcept;
+
+    void VWSLL(Vec vd, Vec vs2, Vec vs1, VecMask mask = VecMask::No) noexcept;
+    void VWSLL(Vec vd, Vec vs2, GPR rs1, VecMask mask = VecMask::No) noexcept;
+    void VWSLL(Vec vd, Vec vs2, uint32_t uimm, VecMask mask = VecMask::No) noexcept;
+
+    void VCLMUL(Vec vd, Vec vs2, Vec vs1, VecMask mask = VecMask::No) noexcept;
+    void VCLMUL(Vec vd, Vec vs2, GPR rs1, VecMask mask = VecMask::No) noexcept;
+
+    void VCLMULH(Vec vd, Vec vs2, Vec vs1, VecMask mask = VecMask::No) noexcept;
+    void VCLMULH(Vec vd, Vec vs2, GPR rs1, VecMask mask = VecMask::No) noexcept;
+
+    void VGHSH(Vec vd, Vec vs2, Vec vs1) noexcept;
+    void VGMUL(Vec vd, Vec vs2) noexcept;
+
+    void VAESDF_VV(Vec vd, Vec vs2) noexcept;
+    void VAESDF_VS(Vec vd, Vec vs2) noexcept;
+
+    void VAESDM_VV(Vec vd, Vec vs2) noexcept;
+    void VAESDM_VS(Vec vd, Vec vs2) noexcept;
+
+    void VAESEF_VV(Vec vd, Vec vs2) noexcept;
+    void VAESEF_VS(Vec vd, Vec vs2) noexcept;
+
+    void VAESEM_VV(Vec vd, Vec vs2) noexcept;
+    void VAESEM_VS(Vec vd, Vec vs2) noexcept;
+
+    void VAESKF1(Vec vd, Vec vs2, uint32_t uimm) noexcept;
+    void VAESKF2(Vec vd, Vec vs2, uint32_t uimm) noexcept;
+
+    void VAESZ(Vec vd, Vec vs2) noexcept;
+
+    void VSHA2MS(Vec vd, Vec vs2, Vec vs1) noexcept;
+    void VSHA2CH(Vec vd, Vec vs2, Vec vs1) noexcept;
+    void VSHA2CL(Vec vd, Vec vs2, Vec vs1) noexcept;
+
+    void VSM4K(Vec vd, Vec vs2, uint32_t uimm) noexcept;
+    void VSM4R_VV(Vec vd, Vec vs2) noexcept;
+    void VSM4R_VS(Vec vd, Vec vs2) noexcept;
+
+    void VSM3C(Vec vd, Vec vs2, uint32_t uimm) noexcept;
+    void VSM3ME(Vec vd, Vec vs2, Vec vs1) noexcept;
+
+    // Zvfbfmin, Zvfbfwma Extension Instructions
+
+    void VFNCVTBF16_F_F_W(Vec vd, Vec vs, VecMask mask = VecMask::No) noexcept;
+    void VFWCVTBF16_F_F_V(Vec vd, Vec vs, VecMask mask = VecMask::No) noexcept;
+
+    void VFWMACCBF16(Vec vd, FPR rs1, Vec vs2, VecMask mask = VecMask::No) noexcept;
+    void VFWMACCBF16(Vec vd, Vec vs1, Vec vs2, VecMask mask = VecMask::No) noexcept;
+
 private:
     // Binds a label to a given offset.
     void BindToOffset(Label* label, Label::LocationOffset offset);
@@ -1279,6 +1469,7 @@ private:
     void ResolveLabelOffsets(Label* label);
 
     CodeBuffer m_buffer;
+    ArchFeature m_features = ArchFeature::RV64;
 };
 
 } // namespace biscuit

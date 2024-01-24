@@ -1,5 +1,8 @@
 #pragma once
 
+#include <biscuit/assert.hpp>
+
+#include <compare>
 #include <cstdint>
 
 namespace biscuit {
@@ -19,76 +22,45 @@ public:
         return m_index;
     }
 
-    /// Determines whether or not this register is a general-purpose register.
-    [[nodiscard]] constexpr bool IsGPR() const noexcept {
-        return m_type == Type::GPR;
-    }
-
-    /// Determines whether or not this register is a floating-point register.
-    [[nodiscard]] constexpr bool IsFPR() const noexcept {
-        return m_type == Type::FPR;
-    }
-
-    /// Determines whether or not this register is a vector register.
-    [[nodiscard]] constexpr bool IsVector() const noexcept {
-        return m_type == Type::Vector;
-    }
+    friend constexpr bool operator==(Register, Register) = default;
+    friend constexpr auto operator<=>(Register, Register) = default;
 
 protected:
-    enum class Type {
-        GPR,    // General purpose register
-        FPR,    // Floating-point register
-        Vector, // Vector register
-    };
-
-    constexpr Register(uint32_t index, Type type) noexcept
-        : m_index{index}, m_type{type} {}
+    constexpr explicit Register(uint32_t index) noexcept
+        : m_index{index} {}
 
 private:
     uint32_t m_index{};
-    Type m_type{};
 };
 
 /// General purpose register.
 class GPR final : public Register {
 public:
-    constexpr GPR() noexcept : Register{0, Type::GPR} {}
-    constexpr explicit GPR(uint32_t index) noexcept : Register{index, Type::GPR} {}
+    constexpr GPR() noexcept : Register{0} {}
+    constexpr explicit GPR(uint32_t index) noexcept : Register{index} {}
 
-    friend constexpr bool operator==(GPR lhs, GPR rhs) noexcept {
-        return lhs.Index() == rhs.Index();
-    }
-    friend constexpr bool operator!=(GPR lhs, GPR rhs) noexcept {
-        return !operator==(lhs, rhs);
-    }
+    friend constexpr bool operator==(GPR, GPR) = default;
+    friend constexpr auto operator<=>(GPR, GPR) = default;
 };
 
 /// Floating point register.
 class FPR final : public Register {
 public:
-    constexpr FPR() noexcept : Register{0, Type::FPR} {}
-    constexpr explicit FPR(uint32_t index) noexcept : Register{index, Type::FPR} {}
+    constexpr FPR() noexcept : Register{0} {}
+    constexpr explicit FPR(uint32_t index) noexcept : Register{index} {}
 
-    friend constexpr bool operator==(FPR lhs, FPR rhs) noexcept {
-        return lhs.Index() == rhs.Index();
-    }
-    friend constexpr bool operator!=(FPR lhs, FPR rhs) noexcept {
-        return !operator==(lhs, rhs);
-    }
+    friend constexpr bool operator==(FPR, FPR) = default;
+    friend constexpr auto operator<=>(FPR, FPR) = default;
 };
 
 /// Vector register.
 class Vec final : public Register {
 public:
-    constexpr Vec() noexcept : Register{0, Type::Vector} {}
-    constexpr explicit Vec(uint32_t index) noexcept : Register{index, Type::Vector} {}
+    constexpr Vec() noexcept : Register{0} {}
+    constexpr explicit Vec(uint32_t index) noexcept : Register{index} {}
 
-    friend constexpr bool operator==(Vec lhs, Vec rhs) noexcept {
-        return lhs.Index() == rhs.Index();
-    }
-    friend constexpr bool operator!=(Vec lhs, Vec rhs) noexcept {
-        return !operator==(lhs, rhs);
-    }
+    friend constexpr bool operator==(Vec, Vec) = default;
+    friend constexpr auto operator<=>(Vec, Vec) = default;
 };
 
 // General-purpose Registers
@@ -272,5 +244,72 @@ constexpr Vec v28{28};
 constexpr Vec v29{29};
 constexpr Vec v30{30};
 constexpr Vec v31{31};
+
+// Register utilities
+
+// Used with compressed stack management instructions
+// (cm.push, cm.pop, etc) for building up a register list to encode.
+//
+// Also enforces that only valid registers are used in the lists.
+class PushPopList final {
+public:
+    // Represents an inclusive range ([start, end]) of registers.
+    struct Range final {
+        // Signifies an empty range. Normally this doesn't need to explicitly
+        // be created. Default parameters will usually take care of it.
+        constexpr Range() : start{UINT32_MAX}, end{UINT32_MAX} {}
+
+        // This particular constructor is used for the case of rlist=5
+        // where only ra and s0 get stored.
+        constexpr Range(GPR start_end) noexcept : start{start_end}, end{start_end} {
+            BISCUIT_ASSERT(start_end == s0);
+        }
+
+        constexpr Range(GPR start_, GPR end_) noexcept : start{start_}, end{end_} {
+            BISCUIT_ASSERT(start_ == s0);
+            BISCUIT_ASSERT(IsSRegister(end_));
+
+            // See the Zc spec. The only way for s10 to be used is to also include s11.
+            BISCUIT_ASSERT(end_ != s10);
+        }
+
+        GPR start;
+        GPR end;
+    };
+
+    // Deliberately non-explicit to allow for convenient instantiation at usage sites.
+    // e.g. Rather than CM.POP(PushPopList{ra, {s0, s2}}, 16), we can just have the
+    //      usage be transparent like CM.POP({ra, {s0, s2}}, 16). Nice and compact!
+    constexpr PushPopList(GPR ra_reg, const Range& range = {}) noexcept
+        : m_bitmask{BuildBitmask(range)} {
+        BISCUIT_ASSERT(ra_reg == ra);
+    }
+
+    // Gets the built-up bitmask of passed in registers
+    [[nodiscard]] constexpr uint32_t GetBitmask() const noexcept {
+        return m_bitmask;
+    }
+
+private:
+    [[nodiscard]] static constexpr uint32_t BuildBitmask(const Range& range) noexcept {
+        if (range.end.Index() == UINT32_MAX) {
+            return 4U;
+        }
+        if (range.end == s11) {
+            return 15U;
+        }
+        if (range.end == s0 || range.end == s1) {
+            return range.end.Index() - 3U;
+        }
+        return range.end.Index() - 11U;
+    }
+
+    // Aside from ra, it's only valid for s0-s11 to show up the register list ranges.
+    [[nodiscard]] static constexpr bool IsSRegister(const GPR gpr) noexcept {
+        return gpr == s0 || gpr == s1 || (gpr >= s2 && gpr <= s11);
+    }
+
+    uint32_t m_bitmask = 0;
+};
 
 } // namespace biscuit

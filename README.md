@@ -21,7 +21,7 @@ Includes both 32-bit and 64-bit instructions in the following:
 | C         | 2.0     |
 | D         | 2.2     |
 | F         | 2.2     |
-| H         | 1.0 RC  |
+| H         | 1.0     |
 | K         | 1.0.1   |
 | M         | 2.0     |
 | N         | 1.1     |
@@ -31,14 +31,27 @@ Includes both 32-bit and 64-bit instructions in the following:
 | S         | 1.12    |
 | V         | 1.0     |
 | Sstc      | 0.5.4   |
+| Zacas     | 1.0     |
+| Zawrs     | 1.01    |
+| Zcb       | 1.0.4   |
+| Zcmp      | 1.0.4   |
+| Zcmt      | 1.0.4   |
+| Zfa       | 1.0     |
+| Zfbfmin   | 1.0 rc2 |
 | Zfh       | 1.0     |
 | Zfhmin    | 1.0     |
 | Zicbom    | 1.0     |
 | Zicbop    | 1.0     |
 | Zicboz    | 1.0     |
+| Zicond    | 1.0.1   |
 | Zicsr     | 2.0     |
 | Zifencei  | 2.0     |
-| Zihintntl | 0.2     |
+| Zihintntl | 1.0     |
+| Zvbb      | 1.0     |
+| Zvbc      | 1.0     |
+| Zvfbfmin  | 1.0 rc2 |
+| Zvfbfwma  | 1.0 rc2 |
+| Zvkn      | 1.0     |
 
 Note that usually only extensions considered ratified will be implemented
 as non-ratified documents are considerably more likely to have

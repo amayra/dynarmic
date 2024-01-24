@@ -182,7 +182,8 @@ void EmitVectorOPIVX(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, G
     buffer.Emit32(value | 0b1010111);
 }
 
-void EmitVectorOPMVV(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, Vec vs1, Vec vd) noexcept {
+void EmitVectorOPMVVImpl(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, Vec vs1, Vec vd,
+                         uint32_t op) noexcept {
     // clang-format off
     const auto value = (funct6 << 26) |
                        (static_cast<uint32_t>(vm) << 25) |
@@ -192,7 +193,15 @@ void EmitVectorOPMVV(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, V
                        (vd.Index() << 7);
     // clang-format on
 
-    buffer.Emit32(value | 0b1010111);
+    buffer.Emit32(value | op);
+}
+
+void EmitVectorOPMVV(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, Vec vs1, Vec vd) noexcept {
+    EmitVectorOPMVVImpl(buffer, funct6, vm, vs2, vs1, vd, 0b1010111);
+}
+
+void EmitVectorOPMVVP(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, Vec vs1, Vec vd) noexcept {
+    EmitVectorOPMVVImpl(buffer, funct6, vm, vs2, vs1, vd, 0b1110111);
 }
 
 void EmitVectorOPMVX(CodeBuffer& buffer, uint32_t funct6, VecMask vm, Vec vs2, GPR rs1, Vec vd) noexcept {
@@ -1946,6 +1955,192 @@ void Assembler::VSETVLI(GPR rd, GPR rs, SEW sew, LMUL lmul, VTA vta, VMA vma) no
     // clang-format on
 
     m_buffer.Emit32(0x00007057U | (zimm << 20) | (rs.Index() << 15) | (rd.Index() << 7));
+}
+
+// Vector Cryptography Instructions
+
+void Assembler::VANDN(Vec vd, Vec vs2, Vec vs1, VecMask mask) noexcept {
+    EmitVectorOPIVV(m_buffer, 0b000001, mask, vs2, vs1, vd);
+}
+void Assembler::VANDN(Vec vd, Vec vs2, GPR rs1, VecMask mask) noexcept {
+    EmitVectorOPIVX(m_buffer, 0b000001, mask, vs2, rs1, vd);
+}
+
+void Assembler::VBREV(Vec vd, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b010010, mask, vs2, Vec{0b01010}, vd);
+}
+void Assembler::VBREV8(Vec vd, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b010010, mask, vs2, Vec{0b01000}, vd);
+}
+void Assembler::VREV8(Vec vd, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b010010, mask, vs2, Vec{0b01001}, vd);
+}
+
+void Assembler::VCLZ(Vec vd, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b010010, mask, vs2, Vec{0b01100}, vd);
+}
+void Assembler::VCTZ(Vec vd, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b010010, mask, vs2, Vec{0b01101}, vd);
+}
+void Assembler::VCPOP(Vec vd, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b010010, mask, vs2, Vec{0b01110}, vd);
+}
+
+void Assembler::VROL(Vec vd, Vec vs2, Vec vs1, VecMask mask) noexcept {
+    EmitVectorOPIVV(m_buffer, 0b010101, mask, vs2, vs1, vd);
+}
+void Assembler::VROL(Vec vd, Vec vs2, GPR rs1, VecMask mask) noexcept {
+    EmitVectorOPIVX(m_buffer, 0b010101, mask, vs2, rs1, vd);
+}
+
+void Assembler::VROR(Vec vd, Vec vs2, Vec vs1, VecMask mask) noexcept {
+    EmitVectorOPIVV(m_buffer, 0b010100, mask, vs2, vs1, vd);
+}
+void Assembler::VROR(Vec vd, Vec vs2, GPR rs1, VecMask mask) noexcept {
+    EmitVectorOPIVX(m_buffer, 0b010100, mask, vs2, rs1, vd);
+}
+void Assembler::VROR(Vec vd, Vec vs2, uint32_t uimm, VecMask mask) noexcept {
+    BISCUIT_ASSERT(uimm <= 63);
+
+    const auto funct6 = 0b010100 | ((uimm & 0b100000) >> 5);
+    EmitVectorOPIVIImpl(m_buffer, funct6, mask, vs2, uimm, vd);
+}
+
+void Assembler::VWSLL(Vec vd, Vec vs2, Vec vs1, VecMask mask) noexcept {
+    EmitVectorOPIVV(m_buffer, 0b110101, mask, vs2, vs1, vd);
+}
+void Assembler::VWSLL(Vec vd, Vec vs2, GPR rs1, VecMask mask) noexcept {
+    EmitVectorOPIVX(m_buffer, 0b110101, mask, vs2, rs1, vd);
+}
+void Assembler::VWSLL(Vec vd, Vec vs2, uint32_t uimm, VecMask mask) noexcept {
+    EmitVectorOPIVUI(m_buffer, 0b110101, mask, vs2, uimm, vd);
+}
+
+void Assembler::VCLMUL(Vec vd, Vec vs2, Vec vs1, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b001100, mask, vs2, vs1, vd);
+}
+void Assembler::VCLMUL(Vec vd, Vec vs2, GPR rs1, VecMask mask) noexcept {
+    EmitVectorOPMVX(m_buffer, 0b001100, mask, vs2, rs1, vd);
+}
+
+void Assembler::VCLMULH(Vec vd, Vec vs2, Vec vs1, VecMask mask) noexcept {
+    EmitVectorOPMVV(m_buffer, 0b001101, mask, vs2, vs1, vd);
+}
+void Assembler::VCLMULH(Vec vd, Vec vs2, GPR rs1, VecMask mask) noexcept {
+    EmitVectorOPMVX(m_buffer, 0b001101, mask, vs2, rs1, vd);
+}
+
+void Assembler::VGHSH(Vec vd, Vec vs2, Vec vs1) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101100, VecMask::No, vs2, vs1, vd);
+}
+void Assembler::VGMUL(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101000, VecMask::No, vs2, Vec{0b10001}, vd);
+}
+
+void Assembler::VAESDF_VV(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101000, VecMask::No, vs2, Vec{0b00001}, vd);
+}
+void Assembler::VAESDF_VS(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101001, VecMask::No, vs2, Vec{0b00001}, vd);
+}
+
+void Assembler::VAESDM_VV(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101000, VecMask::No, vs2, Vec{0}, vd);
+}
+void Assembler::VAESDM_VS(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101001, VecMask::No, vs2, Vec{0}, vd);
+}
+
+void Assembler::VAESEF_VV(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101000, VecMask::No, vs2, Vec{0b00011}, vd);
+}
+void Assembler::VAESEF_VS(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101001, VecMask::No, vs2, Vec{0b00011}, vd);
+}
+
+void Assembler::VAESEM_VV(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101000, VecMask::No, vs2, Vec{0b00010}, vd);
+}
+void Assembler::VAESEM_VS(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101001, VecMask::No, vs2, Vec{0b00010}, vd);
+}
+
+// Little bit of weirdness (at first glance) for these is that the round
+// number immediate has valid ranges:
+//
+// - [1, 10] for VAESKF1
+// - [2, 14] for VAESKF2
+//
+// Any out of range values (0, 11-15) for VAESKF1, (0-1, 15) for VAESKF2
+// will be re-encoded into a valid range by inverting bit uimm[3]
+
+void Assembler::VAESKF1(Vec vd, Vec vs2, uint32_t uimm) noexcept {
+    BISCUIT_ASSERT(uimm <= 15);
+
+    if (uimm == 0 || uimm > 10) {
+        uimm ^= 0b1000;
+    }
+
+    EmitVectorOPMVVP(m_buffer, 0b100010, VecMask::No, vs2, Vec{uimm}, vd);
+}
+void Assembler::VAESKF2(Vec vd, Vec vs2, uint32_t uimm) noexcept {
+    BISCUIT_ASSERT(uimm <= 15);
+
+    if (uimm < 2 || uimm > 14) {
+        uimm ^= 0b1000;
+    }
+
+    EmitVectorOPMVVP(m_buffer, 0b101010, VecMask::No, vs2, Vec{uimm}, vd);
+}
+
+void Assembler::VAESZ(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101001, VecMask::No, vs2, Vec{0b00111}, vd);
+}
+
+void Assembler::VSHA2MS(Vec vd, Vec vs2, Vec vs1) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101101, VecMask::No, vs2, vs1, vd);
+}
+void Assembler::VSHA2CH(Vec vd, Vec vs2, Vec vs1) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101110, VecMask::No, vs2, vs1, vd);
+}
+void Assembler::VSHA2CL(Vec vd, Vec vs2, Vec vs1) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101111, VecMask::No, vs2, vs1, vd);
+}
+
+void Assembler::VSM4K(Vec vd, Vec vs2, uint32_t uimm) noexcept {
+    BISCUIT_ASSERT(uimm <= 7);
+    EmitVectorOPMVVP(m_buffer, 0b100001, VecMask::No, vs2, Vec{uimm}, vd);
+}
+
+void Assembler::VSM4R_VV(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101000, VecMask::No, vs2, Vec{0b10000}, vd);
+}
+void Assembler::VSM4R_VS(Vec vd, Vec vs2) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b101001, VecMask::No, vs2, Vec{0b10000}, vd);
+}
+
+void Assembler::VSM3C(Vec vd, Vec vs2, uint32_t uimm) noexcept {
+    BISCUIT_ASSERT(uimm <= 31);
+    EmitVectorOPMVVP(m_buffer, 0b101011, VecMask::No, vs2, Vec{uimm}, vd);
+}
+void Assembler::VSM3ME(Vec vd, Vec vs2, Vec vs1) noexcept {
+    EmitVectorOPMVVP(m_buffer, 0b100000, VecMask::No, vs2, vs1, vd);
+}
+
+// Zvfbfmin, Zvfbfwma Extension Instructions
+
+void Assembler::VFNCVTBF16_F_F_W(Vec vd, Vec vs, VecMask mask) noexcept {
+    EmitVectorOPFVV(m_buffer, 0b010010, mask, vs, v29, vd);
+}
+void Assembler::VFWCVTBF16_F_F_V(Vec vd, Vec vs, VecMask mask) noexcept {
+    EmitVectorOPFVV(m_buffer, 0b010010, mask, vs, v13, vd);
+}
+
+void Assembler::VFWMACCBF16(Vec vd, FPR rs1, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPFVF(m_buffer, 0b111011, mask, vs2, rs1, vd);
+}
+void Assembler::VFWMACCBF16(Vec vd, Vec vs1, Vec vs2, VecMask mask) noexcept {
+    EmitVectorOPFVV(m_buffer, 0b111011, mask, vs2, vs1, vd);
 }
 
 } // namespace biscuit
