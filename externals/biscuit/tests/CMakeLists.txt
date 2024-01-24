@@ -1,6 +1,7 @@
 project(biscuit_tests)
 
 add_executable(${PROJECT_NAME}
+    src/assembler_bfloat_tests.cpp
     src/assembler_branch_tests.cpp
     src/assembler_cmo_tests.cpp
     src/assembler_privileged_tests.cpp
@@ -15,9 +16,17 @@ add_executable(${PROJECT_NAME}
     src/assembler_rvm_tests.cpp
     src/assembler_rvq_tests.cpp
     src/assembler_rvv_tests.cpp
+    src/assembler_vector_crypto_tests.cpp
+    src/assembler_zacas_tests.cpp
+    src/assembler_zawrs_tests.cpp
+    src/assembler_zc_tests.cpp
+    src/assembler_zfa_tests.cpp
+    src/assembler_zicond_tests.cpp
     src/assembler_zicsr_tests.cpp
     src/assembler_zihintntl_tests.cpp
     src/main.cpp
+
+    src/assembler_test_utils.hpp
 )
 
 target_include_directories(${PROJECT_NAME}

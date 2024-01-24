@@ -3,11 +3,15 @@
 add_library(biscuit
     # Source files
     assembler.cpp
+    assembler_compressed.cpp
     assembler_crypto.cpp
+    assembler_floating_point.cpp
     assembler_vector.cpp
     code_buffer.cpp
+    cpuinfo.cpp
 
     # Headers
+    assembler_util.hpp
     "${PROJECT_SOURCE_DIR}/include/biscuit/assembler.hpp"
     "${PROJECT_SOURCE_DIR}/include/biscuit/assert.hpp"
     "${PROJECT_SOURCE_DIR}/include/biscuit/code_buffer.hpp"
@@ -16,6 +20,7 @@ add_library(biscuit
     "${PROJECT_SOURCE_DIR}/include/biscuit/label.hpp"
     "${PROJECT_SOURCE_DIR}/include/biscuit/registers.hpp"
     "${PROJECT_SOURCE_DIR}/include/biscuit/vector.hpp"
+    "${PROJECT_SOURCE_DIR}/include/biscuit/cpuinfo.hpp"
 )
 add_library(biscuit::biscuit ALIAS biscuit)
 

@@ -1,269 +1,19 @@
 #include <biscuit/assert.hpp>
 #include <biscuit/assembler.hpp>
 
+#include <bit>
 #include <cstring>
 #include <utility>
 
+#include "assembler_util.hpp"
+
 namespace biscuit {
-namespace {
-// Determines if a value lies within the range of a 6-bit immediate.
-[[nodiscard]] bool IsValidSigned6BitImm(ptrdiff_t value) noexcept {
-    return value >= -32 && value <= 31;
-}
-
-// S-type and I-type immediates are 12 bits in size
-[[nodiscard]] bool IsValidSigned12BitImm(ptrdiff_t value) noexcept {
-    return value >= -2048 && value <= 2047;
-}
-
-// B-type immediates only provide -4KiB to +4KiB range branches.
-[[nodiscard]] bool IsValidBTypeImm(ptrdiff_t value) noexcept {
-    return value >= -4096 && value <= 4095;
-}
-
-// J-type immediates only provide -1MiB to +1MiB range branches.
-[[nodiscard]] bool IsValidJTypeImm(ptrdiff_t value) noexcept {
-    return value >= -0x80000 && value <= 0x7FFFF;
-}
-
-// CB-type immediates only provide -256B to +256B range branches.
-[[nodiscard]] bool IsValidCBTypeImm(ptrdiff_t value) noexcept {
-    return value >= -256 && value <= 255;
-}
-
-// CJ-type immediates only provide -2KiB to +2KiB range branches.
-[[nodiscard]] bool IsValidCJTypeImm(ptrdiff_t value) noexcept {
-    return IsValidSigned12BitImm(value);
-}
-
-// Determines whether or not the register fits in 3-bit compressed encoding.
-[[nodiscard]] bool IsValid3BitCompressedReg(Register reg) noexcept {
-    const auto index = reg.Index();
-    return index >= 8 && index <= 15;
-}
-
-// Determines whether or not the given shift amount is valid for a compressed shift instruction
-[[nodiscard]] bool IsValidCompressedShiftAmount(uint32_t shift) noexcept {
-    return shift > 0 && shift <= 64;
-}
-
-// Turns a compressed register into its encoding.
-[[nodiscard]] uint32_t CompressedRegTo3BitEncoding(Register reg) noexcept {
-    return reg.Index() - 8;
-}
-
-// Transforms a regular value into an immediate encoded in a B-type instruction.
-[[nodiscard]] uint32_t TransformToBTypeImm(uint32_t imm) noexcept {
-    // clang-format off
-    return ((imm & 0x07E0) << 20) |
-           ((imm & 0x1000) << 19) |
-           ((imm & 0x001E) << 7) |
-           ((imm & 0x0800) >> 4);
-    // clang-format on
-}
-
-// Transforms a regular value into an immediate encoded in a J-type instruction.
-[[nodiscard]] uint32_t TransformToJTypeImm(uint32_t imm) noexcept {
-    // clang-format off
-    return ((imm & 0x0FF000) >> 0) |
-           ((imm & 0x000800) << 9) |
-           ((imm & 0x0007FE) << 20) |
-           ((imm & 0x100000) << 11);
-    // clang-format on
-}
-
-// Transforms a regular value into an immediate encoded in a CB-type instruction.
-[[nodiscard]] uint32_t TransformToCBTypeImm(uint32_t imm) noexcept {
-    // clang-format off
-    return ((imm & 0x0C0) >> 1) |
-           ((imm & 0x006) << 2) |
-           ((imm & 0x020) >> 3) |
-           ((imm & 0x018) << 7) |
-           ((imm & 0x100) << 4);
-    // clang-format on
-}
-
-// Transforms a regular value into an immediate encoded in a CJ-type instruction.
-[[nodiscard]] uint32_t TransformToCJTypeImm(uint32_t imm) noexcept {
-    // clang-format off
-    return ((imm & 0x800) << 1) |
-           ((imm & 0x010) << 7) |
-           ((imm & 0x300) << 1) |
-           ((imm & 0x400) >> 2) |
-           ((imm & 0x040) << 1) |
-           ((imm & 0x080) >> 1) |
-           ((imm & 0x00E) << 4) |
-           ((imm & 0x020) >> 3);
-    // clang-format on
-}
-
-// Emits a B type RISC-V instruction. These consist of:
-// imm[12|10:5] | rs2 | rs1 | funct3 | imm[4:1] | imm[11] | opcode
-void EmitBType(CodeBuffer& buffer, uint32_t imm, GPR rs2, GPR rs1, uint32_t funct3, uint32_t opcode) noexcept {
-    imm &= 0x1FFE;
-
-    buffer.Emit32(TransformToBTypeImm(imm) | (rs2.Index() << 20) | (rs1.Index() << 15) | ((funct3 & 0b111) << 12) | (opcode & 0x7F));
-}
-
-// Emits a I type RISC-V instruction. These consist of:
-// imm[11:0] | rs1 | funct3 | rd | opcode
-void EmitIType(CodeBuffer& buffer, uint32_t imm, Register rs1, uint32_t funct3, Register rd, uint32_t opcode) noexcept {
-    imm &= 0xFFF;
-
-    buffer.Emit32((imm << 20) | (rs1.Index() << 15) | ((funct3 & 0b111) << 12) | (rd.Index() << 7) | (opcode & 0x7F));
-}
-
-// Emits a J type RISC-V instruction. These consist of:
-// imm[20|10:1|11|19:12] | rd | opcode
-void EmitJType(CodeBuffer& buffer, uint32_t imm, GPR rd, uint32_t opcode) noexcept {
-    imm &= 0x1FFFFE;
-
-    buffer.Emit32(TransformToJTypeImm(imm) | rd.Index() << 7 | (opcode & 0x7F));
-}
-
-// Emits a R type RISC instruction. These consist of:
-// funct7 | rs2 | rs1 | funct3 | rd | opcode
-void EmitRType(CodeBuffer& buffer, uint32_t funct7, Register rs2, Register rs1, uint32_t funct3,
-               Register rd, uint32_t opcode) noexcept {
-    // clang-format off
-    const auto value = ((funct7 & 0xFF) << 25) |
-                       (rs2.Index() << 20) |
-                       (rs1.Index() << 15) |
-                       ((funct3 & 0b111) << 12) |
-                       (rd.Index() << 7) |
-                       (opcode & 0x7F);
-    // clang-format off
-
-    buffer.Emit32(value);
-}
-
-// Emits a R type RISC instruction. These consist of:
-// funct7 | rs2 | rs1 | funct3 | rd | opcode
-void EmitRType(CodeBuffer& buffer, uint32_t funct7, FPR rs2, FPR rs1, RMode funct3, FPR rd, uint32_t opcode) noexcept {
-    EmitRType(buffer, funct7, rs2, rs1, static_cast<uint32_t>(funct3), rd, opcode);
-}
-
-// Emits a R4 type RISC instruction. These consist of:
-// rs3 | funct2 | rs2 | rs1 | funct3 | rd | opcode
-void EmitR4Type(CodeBuffer& buffer, FPR rs3, uint32_t funct2, FPR rs2, FPR rs1, RMode funct3, FPR rd, uint32_t opcode) noexcept {
-    const auto reg_bits = (rs3.Index() << 27) | (rs2.Index() << 20) | (rs1.Index() << 15) | (rd.Index() << 7);
-    const auto funct_bits = ((funct2 & 0b11) << 25) | (static_cast<uint32_t>(funct3) << 12);
-    buffer.Emit32(reg_bits | funct_bits | (opcode & 0x7F));
-}
-
-// Emits a S type RISC-V instruction. These consist of:
-// imm[11:5] | rs2 | rs1 | funct3 | imm[4:0] | opcode
-void EmitSType(CodeBuffer& buffer, uint32_t imm, Register rs2, GPR rs1, uint32_t funct3, uint32_t opcode) noexcept {
-    imm &= 0xFFF;
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x01F) << 7) |
-                         ((imm & 0xFE0) << 20);
-    // clang-format on
-
-    buffer.Emit32(new_imm | (rs2.Index() << 20) | (rs1.Index() << 15) | ((funct3 & 0b111) << 12) | (opcode & 0x7F));
-}
-
-// Emits a U type RISC-V instruction. These consist of:
-// imm[31:12] | rd | opcode
-void EmitUType(CodeBuffer& buffer, uint32_t imm, GPR rd, uint32_t opcode) noexcept {
-    buffer.Emit32((imm & 0x000FFFFF) << 12 | rd.Index() << 7 | (opcode & 0x7F));
-}
-
-// Emits an atomic instruction.
-void EmitAtomic(CodeBuffer& buffer, uint32_t funct5, Ordering ordering, GPR rs2, GPR rs1,
-                uint32_t funct3, GPR rd, uint32_t opcode) noexcept {
-    const auto funct7 = (funct5 << 2) | static_cast<uint32_t>(ordering);
-    EmitRType(buffer, funct7, rs2, rs1, funct3, rd, opcode);
-}
-
-// Emits a fence instruction
-void EmitFENCE(CodeBuffer& buffer, uint32_t fm, FenceOrder pred, FenceOrder succ,
-               GPR rs, uint32_t funct3, GPR rd, uint32_t opcode) noexcept {
-    // clang-format off
-    buffer.Emit32(((fm & 0b1111) << 28) |
-                  (static_cast<uint32_t>(pred) << 24) |
-                  (static_cast<uint32_t>(succ) << 20) |
-                  (rs.Index() << 15) |
-                  ((funct3 & 0b111) << 12) |
-                  (rd.Index() << 7) |
-                  (opcode & 0x7F));
-    // clang-format on
-}
-
-// Emits a compressed branch instruction. These consist of:
-// funct3 | imm[8|4:3] | rs | imm[7:6|2:1|5] | op
-void EmitCompressedBranch(CodeBuffer& buffer, uint32_t funct3, int32_t offset, GPR rs, uint32_t op) noexcept {
-    BISCUIT_ASSERT(IsValidCBTypeImm(offset));
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rs));
-
-    const auto transformed_imm = TransformToCBTypeImm(static_cast<uint32_t>(offset));
-    const auto rs_san = CompressedRegTo3BitEncoding(rs);
-    buffer.Emit16(((funct3 & 0b111) << 13) | transformed_imm | (rs_san << 7) | (op & 0b11));
-}
-
-// Emits a compressed jump instruction. These consist of:
-// funct3 | imm | op
-void EmitCompressedJump(CodeBuffer& buffer, uint32_t funct3, int32_t offset, uint32_t op) noexcept {
-    BISCUIT_ASSERT(IsValidCJTypeImm(offset));
-    buffer.Emit16(TransformToCJTypeImm(static_cast<uint32_t>(offset)) | ((funct3 & 0b111) << 13) | (op & 0b11));
-}
-
-// Emits a compress immediate instruction. These consist of:
-// funct3 | imm | rd | imm | op
-void EmitCompressedImmediate(CodeBuffer& buffer, uint32_t funct3, uint32_t imm, GPR rd, uint32_t op) noexcept {
-    BISCUIT_ASSERT(rd != x0);
-    const auto new_imm = ((imm & 0b11111) << 2) | ((imm & 0b100000) << 7);
-    buffer.Emit16(((funct3 & 0b111) << 13) | new_imm | (rd.Index() << 7) | (op & 0b11));
-}
-
-// Emits a compressed load instruction. These consist of:
-// funct3 | imm | rs1 | imm | rd | op
-void EmitCompressedLoad(CodeBuffer& buffer, uint32_t funct3, uint32_t imm, GPR rs, Register rd, uint32_t op) noexcept {
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rs));
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rd));
-
-    imm &= 0xF8;
-
-    const auto imm_enc = ((imm & 0x38) << 7) | ((imm & 0xC0) >> 1);
-    const auto rd_san = CompressedRegTo3BitEncoding(rd);
-    const auto rs_san = CompressedRegTo3BitEncoding(rs);
-    buffer.Emit16(((funct3 & 0b111) << 13) | imm_enc | (rs_san << 7) | (rd_san << 2) | (op & 0b11));
-}
-
-// Emits a compressed register arithmetic instruction. These consist of:
-// funct6 | rd | funct2 | rs | op
-void EmitCompressedRegArith(CodeBuffer& buffer, uint32_t funct6, GPR rd, uint32_t funct2, GPR rs, uint32_t op) noexcept {
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rs));
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rd));
-
-    const auto rd_san = CompressedRegTo3BitEncoding(rd);
-    const auto rs_san = CompressedRegTo3BitEncoding(rs);
-    buffer.Emit16(((funct6 & 0b111111) << 10) | (rd_san << 7) | ((funct2 & 0b11) << 5) | (rs_san << 2) | (op & 0b11));
-}
-
-// Emits a compressed store instruction. These consist of:
-// funct3 | imm | rs1 | imm | rs2 | op
-void EmitCompressedStore(CodeBuffer& buffer, uint32_t funct3, uint32_t imm, GPR rs1, Register rs2, uint32_t op) noexcept {
-    // This has the same format as a compressed load, with rs2 taking the place of rd.
-    // We can reuse the code we've already written to handle this.
-    EmitCompressedLoad(buffer, funct3, imm, rs1, rs2, op);
-}
-
-// Emits a compressed wide immediate instruction. These consist of:
-// funct3 | imm | rd | opcode
-void EmitCompressedWideImmediate(CodeBuffer& buffer, uint32_t funct3, uint32_t imm, GPR rd, uint32_t op) noexcept {
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rd));
-    const auto rd_sanitized = CompressedRegTo3BitEncoding(rd);
-    buffer.Emit16(((funct3 & 0b111) << 13) | ((imm & 0xFF) << 5) | (rd_sanitized << 2) | (op & 0b11));
-}
-} // Anonymous namespace
 
 Assembler::Assembler(size_t capacity)
     : m_buffer(capacity) {}
 
-Assembler::Assembler(uint8_t* buffer, size_t capacity)
-    : m_buffer(buffer, capacity) {}
+Assembler::Assembler(uint8_t* buffer, size_t capacity, ArchFeature features)
+    : m_buffer(buffer, capacity), m_features{features} {}
 
 Assembler::~Assembler() = default;
 
@@ -554,31 +304,68 @@ void Assembler::LHU(GPR rd, int32_t imm, GPR rs) noexcept {
     EmitIType(m_buffer, static_cast<uint32_t>(imm), rs, 0b101, rd, 0b0000011);
 }
 
-void Assembler::LI(GPR rd, uint32_t imm) noexcept {
-    const auto lower = imm & 0xFFF;
-    const auto upper = (imm & 0xFFFFF000) >> 12;
-    const auto simm = static_cast<int32_t>(imm);
+void Assembler::LI(GPR rd, uint64_t imm) noexcept {
+    if (IsRV32(m_features)) {
+        // Depending on imm, the following instructions are emitted.
+        // hi20 == 0              -> ADDI
+        // lo12 == 0 && hi20 != 0 -> LUI
+        // otherwise              -> LUI+ADDI
 
-    // If the immediate can fit within 12 bits, we only need to emit an ADDI.
-    if (IsValidSigned12BitImm(simm)) {
-        ADDI(rd, x0, static_cast<int32_t>(lower));
+        // Add 0x800 to cancel out the signed extension of ADDI.
+        const auto uimm32 = static_cast<uint32_t>(imm);
+        const auto hi20 = (uimm32 + 0x800) >> 12 & 0xFFFFF;
+        const auto lo12 = static_cast<int32_t>(uimm32) & 0xFFF;
+        GPR rs1 = zero;
+
+        if (hi20 != 0) {
+            LUI(rd, hi20);
+            rs1 = rd;
+        }
+
+        if (lo12 != 0 || hi20 == 0) {
+            ADDI(rd, rs1, lo12);
+        }
     } else {
-        const bool needs_increment = (lower & 0x800) != 0;
-        const auto upper_imm = needs_increment ? upper + 1 : upper;
+        // For 64-bit imm, a sequence of up to 8 instructions (i.e. LUI+ADDIW+SLLI+
+        // ADDI+SLLI+ADDI+SLLI+ADDI) is emitted.
+        // In the following, imm is processed from LSB to MSB while instruction emission
+        // is performed from MSB to LSB by calling LI() recursively. In each recursion,
+        // the lowest 12 bits are removed from imm and the optimal shift amount is
+        // calculated. Then, the remaining part of imm is processed recursively and
+        // LI() get called as soon as it fits into 32 bits.
 
-        // Note that we add 1 to the upper portion of the immediate if the lower
-        // immediate's most significant bit is set. This is necessary, as ADDI
-        // sign-extends its 12-bit immediate before performing addition.
-        //
-        // In the event of the sign-extension, this means that we'll be adding
-        // an equivalent of "lower - 4096" to the upper immediate.
-        //
-        // We add 1 to the upper part of the immediate. the upper part's least
-        // significant bit is bit 12. Adding 1 to this bit is equivalent to adding
-        // 4096, which counteracts the sign-extension, preserving the value.
+        if (static_cast<uint64_t>(static_cast<int64_t>(imm << 32) >> 32) == imm) {
+            // Depending on imm, the following instructions are emitted.
+            // hi20 == 0              -> ADDIW
+            // lo12 == 0 && hi20 != 0 -> LUI
+            // otherwise              -> LUI+ADDIW
 
-        LUI(rd, upper_imm);
-        ADDI(rd, rd, static_cast<int32_t>(lower));
+            // Add 0x800 to cancel out the signed extension of ADDIW.
+            const auto hi20 = (static_cast<uint32_t>(imm) + 0x800) >> 12 & 0xFFFFF;
+            const auto lo12 = static_cast<int32_t>(imm) & 0xFFF;
+            GPR rs1 = zero;
+
+            if (hi20 != 0) {
+                LUI(rd, hi20);
+                rs1 = rd;
+            }
+
+            if (lo12 != 0 || hi20 == 0) {
+                ADDIW(rd, rs1, lo12);
+            }
+            return;
+        }
+
+        const auto lo12 = static_cast<int32_t>(static_cast<int64_t>(imm << 52) >> 52);
+        // Add 0x800 to cancel out the signed extension of ADDI.
+        uint64_t hi52 = (imm + 0x800) >> 12;
+        const uint32_t shift = 12 + static_cast<uint32_t>(std::countr_zero(hi52));
+        hi52 = static_cast<uint64_t>((static_cast<int64_t>(hi52 >> (shift - 12)) << shift) >> shift);
+        LI(rd, hi52);
+        SLLI(rd, rd, shift);
+        if (lo12 != 0) {
+            ADDI(rd, rd, lo12);
+        }
     }
 }
 
@@ -646,8 +433,13 @@ void Assembler::SLL(GPR rd, GPR lhs, GPR rhs) noexcept {
 }
 
 void Assembler::SLLI(GPR rd, GPR rs, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(shift <= 31);
-    EmitIType(m_buffer, shift & 0x1F, rs, 0b001, rd, 0b0010011);
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(shift <= 31);
+        EmitIType(m_buffer, shift & 0x1F, rs, 0b001, rd, 0b0010011);
+    } else {
+        BISCUIT_ASSERT(shift <= 63);
+        EmitIType(m_buffer, shift & 0x3F, rs, 0b001, rd, 0b0010011);
+    }
 }
 
 void Assembler::SLT(GPR rd, GPR lhs, GPR rhs) noexcept {
@@ -681,8 +473,13 @@ void Assembler::SRA(GPR rd, GPR lhs, GPR rhs) noexcept {
 }
 
 void Assembler::SRAI(GPR rd, GPR rs, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(shift <= 31);
-    EmitIType(m_buffer, (0b0100000 << 5) | (shift & 0x1F), rs, 0b101, rd, 0b0010011);
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(shift <= 31);
+        EmitIType(m_buffer, (0b0100000 << 5) | (shift & 0x1F), rs, 0b101, rd, 0b0010011);
+    } else {
+        BISCUIT_ASSERT(shift <= 63);
+        EmitIType(m_buffer, (0b0100000 << 5) | (shift & 0x3F), rs, 0b101, rd, 0b0010011);
+    }
 }
 
 void Assembler::SRL(GPR rd, GPR lhs, GPR rhs) noexcept {
@@ -690,8 +487,13 @@ void Assembler::SRL(GPR rd, GPR lhs, GPR rhs) noexcept {
 }
 
 void Assembler::SRLI(GPR rd, GPR rs, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(shift <= 31);
-    EmitIType(m_buffer, shift & 0x1F, rs, 0b101, rd, 0b0010011);
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(shift <= 31);
+        EmitIType(m_buffer, shift & 0x1F, rs, 0b101, rd, 0b0010011);
+    } else {
+        BISCUIT_ASSERT(shift <= 63);
+        EmitIType(m_buffer, shift & 0x3F, rs, 0b101, rd, 0b0010011);
+    }
 }
 
 void Assembler::SUB(GPR rd, GPR lhs, GPR rhs) noexcept {
@@ -714,66 +516,106 @@ void Assembler::XORI(GPR rd, GPR rs, uint32_t imm) noexcept {
 // RV64I Instructions
 
 void Assembler::ADDIW(GPR rd, GPR rs, int32_t imm) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitIType(m_buffer, static_cast<uint32_t>(imm), rs, 0b000, rd, 0b0011011);
 }
 
 void Assembler::ADDW(GPR rd, GPR lhs, GPR rhs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0000000, rhs, lhs, 0b000, rd, 0b0111011);
 }
 
 void Assembler::LD(GPR rd, int32_t imm, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(IsValidSigned12BitImm(imm));
     EmitIType(m_buffer, static_cast<uint32_t>(imm), rs, 0b011, rd, 0b0000011);
 }
 
 void Assembler::LWU(GPR rd, int32_t imm, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(IsValidSigned12BitImm(imm));
     EmitIType(m_buffer, static_cast<uint32_t>(imm), rs, 0b110, rd, 0b0000011);
 }
 
 void Assembler::SD(GPR rs2, int32_t imm, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(IsValidSigned12BitImm(imm));
     EmitSType(m_buffer, static_cast<uint32_t>(imm), rs2, rs1, 0b011, 0b0100011);
 }
 
-void Assembler::SRAI64(GPR rd, GPR rs, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(shift <= 63);
-    EmitIType(m_buffer, (0b0100000 << 5) | (shift & 0x3F), rs, 0b101, rd, 0b0010011);
-}
-void Assembler::SLLI64(GPR rd, GPR rs, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(shift <= 63);
-    EmitIType(m_buffer, shift & 0x3F, rs, 0b001, rd, 0b0010011);
-}
-void Assembler::SRLI64(GPR rd, GPR rs, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(shift <= 63);
-    EmitIType(m_buffer, shift & 0x3F, rs, 0b101, rd, 0b0010011);
-}
-
 void Assembler::SLLIW(GPR rd, GPR rs, uint32_t shift) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(shift <= 31);
     EmitIType(m_buffer, shift & 0x1F, rs, 0b001, rd, 0b0011011);
 }
 void Assembler::SRAIW(GPR rd, GPR rs, uint32_t shift) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(shift <= 31);
     EmitIType(m_buffer, (0b0100000 << 5) | (shift & 0x1F), rs, 0b101, rd, 0b0011011);
 }
 void Assembler::SRLIW(GPR rd, GPR rs, uint32_t shift) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(shift <= 31);
     EmitIType(m_buffer, shift & 0x1F, rs, 0b101, rd, 0b0011011);
 }
 
 void Assembler::SLLW(GPR rd, GPR lhs, GPR rhs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0000000, rhs, lhs, 0b001, rd, 0b0111011);
 }
 void Assembler::SRAW(GPR rd, GPR lhs, GPR rhs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0100000, rhs, lhs, 0b101, rd, 0b0111011);
 }
 void Assembler::SRLW(GPR rd, GPR lhs, GPR rhs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0000000, rhs, lhs, 0b101, rd, 0b0111011);
 }
 
 void Assembler::SUBW(GPR rd, GPR lhs, GPR rhs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0100000, rhs, lhs, 0b000, rd, 0b0111011);
+}
+
+// Zawrs Extension Instructions
+
+void Assembler::WRS_NTO() noexcept {
+    EmitIType(m_buffer, 0b01101, x0, 0, x0, 0b1110011);
+}
+void Assembler::WRS_STO() noexcept {
+    EmitIType(m_buffer, 0b11101, x0, 0, x0, 0b1110011);
+}
+
+// Zacas Extension Instructions
+
+void Assembler::AMOCAS_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT((rd.Index() % 2) == 0);
+        BISCUIT_ASSERT((rs1.Index() % 2) == 0);
+        BISCUIT_ASSERT((rs2.Index() % 2) == 0);
+    }
+    EmitAtomic(m_buffer, 0b00101, ordering, rs2, rs1, 0b011, rd, 0b0101111);
+}
+void Assembler::AMOCAS_Q(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
+
+    // Both rd and rs2 indicate a register pair, so they need to be even-numbered.
+    BISCUIT_ASSERT((rd.Index() % 2) == 0);
+    BISCUIT_ASSERT((rs1.Index() % 2) == 0);
+    BISCUIT_ASSERT((rs2.Index() % 2) == 0);
+    EmitAtomic(m_buffer, 0b00101, ordering, rs2, rs1, 0b100, rd, 0b0101111);
+}
+void Assembler::AMOCAS_W(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    EmitAtomic(m_buffer, 0b00101, ordering, rs2, rs1, 0b010, rd, 0b0101111);
+}
+
+// Zicond Extension Instructions
+
+void Assembler::CZERO_EQZ(GPR rd, GPR value, GPR condition) noexcept {
+    EmitRType(m_buffer, 0b0000111, condition, value, 0b101, rd, 0b0110011);
+}
+void Assembler::CZERO_NEZ(GPR rd, GPR value, GPR condition) noexcept {
+    EmitRType(m_buffer, 0b0000111, condition, value, 0b111, rd, 0b0110011);
 }
 
 // Zicsr Extension Instructions
@@ -1000,494 +842,54 @@ void Assembler::SC_W(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
 // RV64A Extension Instructions
 
 void Assembler::AMOADD_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b00000, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOAND_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b01100, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOMAX_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b10100, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOMAXU_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b11100, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOMIN_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b10000, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOMINU_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b11000, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOOR_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b01000, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOSWAP_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b00001, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::AMOXOR_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b00100, ordering, rs2, rs1, 0b011, rd, 0b0101111);
 }
 void Assembler::LR_D(Ordering ordering, GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b00010, ordering, x0, rs, 0b011, rd, 0b0101111);
 }
 void Assembler::SC_D(Ordering ordering, GPR rd, GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitAtomic(m_buffer, 0b00011, ordering, rs2, rs1, 0b011, rd, 0b0101111);
-}
-
-// RV32F Extension Instructions
-
-void Assembler::FADD_S(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000000, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FCLASS_S(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110000, f0, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FCVT_S_W(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101000, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_S_WU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101000, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_W_S(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100000, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_WU_S(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100000, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FDIV_S(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001100, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FEQ_S(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010000, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FLE_S(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010000, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FLT_S(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010000, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FLW(FPR rd, int32_t offset, GPR rs) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitIType(m_buffer, static_cast<uint32_t>(offset), rs, 0b010, rd, 0b0000111);
-}
-void Assembler::FMADD_S(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b00, rs2, rs1, rmode, rd, 0b1000011);
-}
-void Assembler::FMAX_S(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FMIN_S(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMSUB_S(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b00, rs2, rs1, rmode, rd, 0b1000111);
-}
-void Assembler::FMUL_S(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001000, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FMV_W_X(FPR rd, GPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1111000, f0, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMV_X_W(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110000, f0, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FNMADD_S(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b00, rs2, rs1, rmode, rd, 0b1001111);
-}
-void Assembler::FNMSUB_S(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b00, rs2, rs1, rmode, rd, 0b1001011);
-}
-void Assembler::FSGNJ_S(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010000, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FSGNJN_S(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010000, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FSGNJX_S(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010000, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FSQRT_S(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0101100, f0, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSUB_S(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000100, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSW(FPR rs2, int32_t offset, GPR rs1) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitSType(m_buffer, static_cast<uint32_t>(offset), rs2, rs1, 0b010, 0b0100111);
-}
-
-void Assembler::FABS_S(FPR rd, FPR rs) noexcept {
-    FSGNJX_S(rd, rs, rs);
-}
-void Assembler::FMV_S(FPR rd, FPR rs) noexcept {
-    FSGNJ_S(rd, rs, rs);
-}
-void Assembler::FNEG_S(FPR rd, FPR rs) noexcept {
-    FSGNJN_S(rd, rs, rs);
-}
-
-// RV64F Extension Instructions
-
-void Assembler::FCVT_L_S(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100000, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_LU_S(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100000, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_S_L(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101000, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_S_LU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101000, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-
-// RV32D Extension Instructions
-
-void Assembler::FADD_D(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000001, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FCLASS_D(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110001, f0, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FCVT_D_W(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101001, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_D_WU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101001, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_W_D(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100001, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_WU_D(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100001, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_D_S(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100001, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_S_D(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100000, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FDIV_D(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001101, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FEQ_D(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010001, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FLE_D(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010001, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FLT_D(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010001, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FLD(FPR rd, int32_t offset, GPR rs) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitIType(m_buffer, static_cast<uint32_t>(offset), rs, 0b011, rd, 0b0000111);
-}
-void Assembler::FMADD_D(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b01, rs2, rs1, rmode, rd, 0b1000011);
-}
-void Assembler::FMAX_D(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010101, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FMIN_D(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010101, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMSUB_D(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b01, rs2, rs1, rmode, rd, 0b1000111);
-}
-void Assembler::FMUL_D(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001001, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FNMADD_D(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b01, rs2, rs1, rmode, rd, 0b1001111);
-}
-void Assembler::FNMSUB_D(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b01, rs2, rs1, rmode, rd, 0b1001011);
-}
-void Assembler::FSGNJ_D(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010001, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FSGNJN_D(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010001, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FSGNJX_D(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010001, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FSQRT_D(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0101101, f0, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSUB_D(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000101, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSD(FPR rs2, int32_t offset, GPR rs1) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitSType(m_buffer, static_cast<uint32_t>(offset), rs2, rs1, 0b011, 0b0100111);
-}
-
-void Assembler::FABS_D(FPR rd, FPR rs) noexcept {
-    FSGNJX_D(rd, rs, rs);
-}
-void Assembler::FMV_D(FPR rd, FPR rs) noexcept {
-    FSGNJ_D(rd, rs, rs);
-}
-void Assembler::FNEG_D(FPR rd, FPR rs) noexcept {
-    FSGNJN_D(rd, rs, rs);
-}
-
-// RV64D Extension Instructions
-
-void Assembler::FCVT_L_D(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100001, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_LU_D(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100001, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_D_L(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101001, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_D_LU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101001, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FMV_D_X(FPR rd, GPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1111001, f0, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMV_X_D(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110001, f0, rs1, 0b000, rd, 0b1010011);
-}
-
-// RV32Q Extension Instructions
-
-void Assembler::FADD_Q(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000011, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FCLASS_Q(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110011, f0, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FCVT_Q_W(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101011, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_Q_WU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101011, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_W_Q(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100011, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_WU_Q(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100011, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_Q_D(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100011, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_D_Q(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100001, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_Q_S(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100011, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_S_Q(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100000, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FDIV_Q(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001111, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FEQ_Q(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010011, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FLE_Q(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010011, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FLT_Q(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010011, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FLQ(FPR rd, int32_t offset, GPR rs) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitIType(m_buffer, static_cast<uint32_t>(offset), rs, 0b100, rd, 0b0000111);
-}
-void Assembler::FMADD_Q(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b11, rs2, rs1, rmode, rd, 0b1000011);
-}
-void Assembler::FMAX_Q(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010111, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FMIN_Q(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010111, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMSUB_Q(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b11, rs2, rs1, rmode, rd, 0b1000111);
-}
-void Assembler::FMUL_Q(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001011, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FNMADD_Q(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b11, rs2, rs1, rmode, rd, 0b1001111);
-}
-void Assembler::FNMSUB_Q(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b11, rs2, rs1, rmode, rd, 0b1001011);
-}
-void Assembler::FSGNJ_Q(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010011, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FSGNJN_Q(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010011, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FSGNJX_Q(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010011, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FSQRT_Q(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0101111, f0, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSUB_Q(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000111, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSQ(FPR rs2, int32_t offset, GPR rs1) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitSType(m_buffer, static_cast<uint32_t>(offset), rs2, rs1, 0b100, 0b0100111);
-}
-
-void Assembler::FABS_Q(FPR rd, FPR rs) noexcept {
-    FSGNJX_Q(rd, rs, rs);
-}
-void Assembler::FMV_Q(FPR rd, FPR rs) noexcept {
-    FSGNJ_Q(rd, rs, rs);
-}
-void Assembler::FNEG_Q(FPR rd, FPR rs) noexcept {
-    FSGNJN_Q(rd, rs, rs);
-}
-
-// RV64Q Extension Instructions
-
-void Assembler::FCVT_L_Q(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100011, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_LU_Q(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100011, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_Q_L(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101011, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_Q_LU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101011, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-
-// RV32Zfh Extension Instructions
-
-void Assembler::FADD_H(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000010, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FCLASS_H(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110010, f0, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FCVT_D_H(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100001, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_D(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100010, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_Q(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100010, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_S(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100010, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_W(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101010, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_WU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101010, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_Q_H(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100011, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_S_H(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0100000, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_W_H(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100010, f0, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_WU_H(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100010, f1, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FDIV_H(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001110, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FEQ_H(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010010, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FLE_H(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010010, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FLH(FPR rd, int32_t offset, GPR rs) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitIType(m_buffer, static_cast<uint32_t>(offset), rs, 0b001, rd, 0b0000111);
-}
-void Assembler::FLT_H(GPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b1010010, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FMADD_H(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b10, rs2, rs1, rmode, rd, 0b1000011);
-}
-void Assembler::FMAX_H(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010110, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FMIN_H(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010110, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMSUB_H(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b10, rs2, rs1, rmode, rd, 0b1000111);
-}
-void Assembler::FMUL_H(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0001010, rs2, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FMV_H_X(FPR rd, GPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1111010, f0, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FMV_X_H(GPR rd, FPR rs1) noexcept {
-    EmitRType(m_buffer, 0b1110010, f0, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FNMADD_H(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b10, rs2, rs1, rmode, rd, 0b1001111);
-}
-void Assembler::FNMSUB_H(FPR rd, FPR rs1, FPR rs2, FPR rs3, RMode rmode) noexcept {
-    EmitR4Type(m_buffer, rs3, 0b10, rs2, rs1, rmode, rd, 0b1001011);
-}
-void Assembler::FSGNJ_H(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010010, rs2, rs1, 0b000, rd, 0b1010011);
-}
-void Assembler::FSGNJN_H(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010010, rs2, rs1, 0b001, rd, 0b1010011);
-}
-void Assembler::FSGNJX_H(FPR rd, FPR rs1, FPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010010, rs2, rs1, 0b010, rd, 0b1010011);
-}
-void Assembler::FSH(FPR rs2, int32_t offset, GPR rs1) noexcept {
-    BISCUIT_ASSERT(IsValidSigned12BitImm(offset));
-    EmitSType(m_buffer, static_cast<uint32_t>(offset), rs2, rs1, 0b001, 0b0100111);
-}
-void Assembler::FSQRT_H(FPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0101110, f0, rs1, rmode, rd, 0b1010011);
-}
-void Assembler::FSUB_H(FPR rd, FPR rs1, FPR rs2, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b0000110, rs2, rs1, rmode, rd, 0b1010011);
-}
-
-// RV64Zfh Extension Instructions
-
-void Assembler::FCVT_L_H(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100010, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_LU_H(GPR rd, FPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1100010, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_L(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101010, f2, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
-}
-void Assembler::FCVT_H_LU(FPR rd, GPR rs1, RMode rmode) noexcept {
-    EmitRType(m_buffer, 0b1101010, f3, rs1, static_cast<uint32_t>(rmode), rd, 0b1010011);
 }
 
 // RVB Extension Instructions
 
 void Assembler::ADDUW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0000100, rs2, rs1, 0b000, rd, 0b0111011);
 }
 
@@ -1500,7 +902,12 @@ void Assembler::BCLR(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::BCLRI(GPR rd, GPR rs, uint32_t bit) noexcept {
-    BISCUIT_ASSERT(bit <= 63);
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(bit <= 31);
+    } else {
+        BISCUIT_ASSERT(bit <= 63);
+    }
+
     const auto imm = (0b010010U << 6) | bit;
     EmitIType(m_buffer, imm, rs, 0b001, rd, 0b0010011);
 }
@@ -1510,7 +917,12 @@ void Assembler::BEXT(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::BEXTI(GPR rd, GPR rs, uint32_t bit) noexcept {
-    BISCUIT_ASSERT(bit <= 63);
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(bit <= 31);
+    } else {
+        BISCUIT_ASSERT(bit <= 63);
+    }
+
     const auto imm = (0b010010U << 6) | bit;
     EmitIType(m_buffer, imm, rs, 0b101, rd, 0b0010011);
 }
@@ -1520,9 +932,33 @@ void Assembler::BINV(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::BINVI(GPR rd, GPR rs, uint32_t bit) noexcept {
-    BISCUIT_ASSERT(bit <= 63);
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(bit <= 31);
+    } else {
+        BISCUIT_ASSERT(bit <= 63);
+    }
+
     const auto imm = (0b011010U << 6) | bit;
     EmitIType(m_buffer, imm, rs, 0b001, rd, 0b0010011);
+}
+
+void Assembler::BREV8(GPR rd, GPR rs) noexcept {
+    EmitIType(m_buffer, 0b011010000111, rs, 0b101, rd, 0b0010011);
+}
+
+void Assembler::BSET(GPR rd, GPR rs1, GPR rs2) noexcept {
+    EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b001, rd, 0b0110011);
+}
+
+void Assembler::BSETI(GPR rd, GPR rs, uint32_t bit) noexcept {
+    if (IsRV32(m_features)) {
+        BISCUIT_ASSERT(bit <= 31);
+    } else {
+        BISCUIT_ASSERT(bit <= 63);
+    }
+
+    const auto imm = (0b001010U << 6) | bit;
+    EmitIType(m_buffer, imm, rs, 0b001, rd, 0b0110011);
 }
 
 void Assembler::CLMUL(GPR rd, GPR rs1, GPR rs2) noexcept {
@@ -1542,6 +978,7 @@ void Assembler::CLZ(GPR rd, GPR rs) noexcept {
 }
 
 void Assembler::CLZW(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitIType(m_buffer, 0b011000000000, rs, 0b001, rd, 0b0011011);
 }
 
@@ -1550,6 +987,7 @@ void Assembler::CPOP(GPR rd, GPR rs) noexcept {
 }
 
 void Assembler::CPOPW(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitIType(m_buffer, 0b011000000010, rs, 0b001, rd, 0b0011011);
 }
 
@@ -1558,6 +996,7 @@ void Assembler::CTZ(GPR rd, GPR rs) noexcept {
 }
 
 void Assembler::CTZW(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitIType(m_buffer, 0b011000000001, rs, 0b001, rd, 0b0011011);
 }
 
@@ -1594,19 +1033,16 @@ void Assembler::PACKH(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::PACKW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0000100, rs2, rs1, 0b100, rd, 0b0111011);
 }
 
-void Assembler::REV8_32(GPR rd, GPR rs) noexcept {
-    EmitIType(m_buffer, 0b011010011000, rs, 0b101, rd, 0b0010011);
-}
-
-void Assembler::REV8_64(GPR rd, GPR rs) noexcept {
-    EmitIType(m_buffer, 0b011010111000, rs, 0b101, rd, 0b0010011);
-}
-
-void Assembler::REV_B(GPR rd, GPR rs) noexcept {
-    EmitIType(m_buffer, 0b011010000111, rs, 0b101, rd, 0b0010011);
+void Assembler::REV8(GPR rd, GPR rs) noexcept {
+    if (IsRV32(m_features)) {
+        EmitIType(m_buffer, 0b011010011000, rs, 0b101, rd, 0b0010011);
+    } else {
+        EmitIType(m_buffer, 0b011010111000, rs, 0b101, rd, 0b0010011);
+    }
 }
 
 void Assembler::ROL(GPR rd, GPR rs1, GPR rs2) noexcept {
@@ -1614,6 +1050,7 @@ void Assembler::ROL(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::ROLW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0110000, rs2, rs1, 0b001, rd, 0b0111011);
 }
 
@@ -1628,12 +1065,14 @@ void Assembler::RORI(GPR rd, GPR rs, uint32_t rotate_amount) noexcept {
 }
 
 void Assembler::RORIW(GPR rd, GPR rs, uint32_t rotate_amount) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(rotate_amount <= 63);
     const auto imm = (0b011000U << 6) | rotate_amount;
     EmitIType(m_buffer, imm, rs, 0b101, rd, 0b0011011);
 }
 
 void Assembler::RORW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0110000, rs2, rs1, 0b101, rd, 0b0111011);
 }
 
@@ -1650,6 +1089,7 @@ void Assembler::SH1ADD(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::SH1ADDUW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0010000, rs2, rs1, 0b010, rd, 0b0111011);
 }
 
@@ -1658,6 +1098,7 @@ void Assembler::SH2ADD(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::SH2ADDUW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0010000, rs2, rs1, 0b100, rd, 0b0111011);
 }
 
@@ -1666,16 +1107,19 @@ void Assembler::SH3ADD(GPR rd, GPR rs1, GPR rs2) noexcept {
 }
 
 void Assembler::SH3ADDUW(GPR rd, GPR rs1, GPR rs2) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0010000, rs2, rs1, 0b110, rd, 0b0111011);
 }
 
 void Assembler::SLLIUW(GPR rd, GPR rs, uint32_t shift_amount) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     BISCUIT_ASSERT(shift_amount <= 63);
     const auto imm = (0b000010U << 6) | shift_amount;
     EmitIType(m_buffer, imm, rs, 0b001, rd, 0b0011011);
 }
 
 void Assembler::UNZIP(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV32(m_features));
     EmitIType(m_buffer, 0b000010011111, rs, 0b101, rd, 0b0010011);
 }
 
@@ -1683,20 +1127,20 @@ void Assembler::XNOR(GPR rd, GPR rs1, GPR rs2) noexcept {
     EmitRType(m_buffer, 0b0100000, rs2, rs1, 0b100, rd, 0b0110011);
 }
 
-void Assembler::XPERMB(GPR rd, GPR rs1, GPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b100, rd, 0b0110011);
-}
-
-void Assembler::XPERMN(GPR rd, GPR rs1, GPR rs2) noexcept {
+void Assembler::XPERM4(GPR rd, GPR rs1, GPR rs2) noexcept {
     EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b010, rd, 0b0110011);
 }
 
-void Assembler::ZEXTH_32(GPR rd, GPR rs) noexcept {
-    EmitIType(m_buffer, 0b000010000000, rs, 0b100, rd, 0b0110011);
+void Assembler::XPERM8(GPR rd, GPR rs1, GPR rs2) noexcept {
+    EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b100, rd, 0b0110011);
 }
 
-void Assembler::ZEXTH_64(GPR rd, GPR rs) noexcept {
-    EmitIType(m_buffer, 0b000010000000, rs, 0b100, rd, 0b0111011);
+void Assembler::ZEXTH(GPR rd, GPR rs) noexcept {
+    if (IsRV32(m_features)) {
+        EmitIType(m_buffer, 0b000010000000, rs, 0b100, rd, 0b0110011);
+    } else {
+        EmitIType(m_buffer, 0b000010000000, rs, 0b100, rd, 0b0111011);
+    }
 }
 
 void Assembler::ZEXTW(GPR rd, GPR rs) noexcept {
@@ -1704,430 +1148,8 @@ void Assembler::ZEXTW(GPR rd, GPR rs) noexcept {
 }
 
 void Assembler::ZIP(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV32(m_features));
     EmitIType(m_buffer, 0b000010011110, rs, 0b001, rd, 0b0010011);
-}
-
-void Assembler::BSET(GPR rd, GPR rs1, GPR rs2) noexcept {
-    EmitRType(m_buffer, 0b0010100, rs2, rs1, 0b001, rd, 0b0110011);
-}
-
-void Assembler::BSETI(GPR rd, GPR rs, uint32_t bit) noexcept {
-    BISCUIT_ASSERT(bit <= 63);
-    const auto imm = (0b001010U << 6) | bit;
-    EmitIType(m_buffer, imm, rs, 0b001, rd, 0b0110011);
-}
-
-// RVC Extension Instructions
-
-void Assembler::C_ADD(GPR rd, GPR rs) noexcept {
-    BISCUIT_ASSERT(rs != x0);
-    m_buffer.Emit16(0x9002 | (rd.Index() << 7) | (rs.Index() << 2));
-}
-
-void Assembler::C_ADDI(GPR rd, int32_t imm) noexcept {
-    BISCUIT_ASSERT(imm != 0);
-    BISCUIT_ASSERT(IsValidSigned6BitImm(imm));
-    EmitCompressedImmediate(m_buffer, 0b000, static_cast<uint32_t>(imm), rd, 0b01);
-}
-
-void Assembler::C_ADDIW(GPR rd, int32_t imm) noexcept {
-    BISCUIT_ASSERT(IsValidSigned6BitImm(imm));
-    EmitCompressedImmediate(m_buffer, 0b001, static_cast<uint32_t>(imm), rd, 0b01);
-}
-
-void Assembler::C_ADDI4SPN(GPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm != 0);
-    BISCUIT_ASSERT(imm <= 1020);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x030) << 2) |
-                         ((imm & 0x3C0) >> 4) |
-                         ((imm & 0x004) >> 1) |
-                         ((imm & 0x008) >> 3);
-    // clang-format on
-
-    EmitCompressedWideImmediate(m_buffer, 0b000, new_imm, rd, 0b00);
-}
-
-void Assembler::C_ADDW(GPR rd, GPR rs) noexcept {
-    EmitCompressedRegArith(m_buffer, 0b100111, rd, 0b01, rs, 0b01);
-}
-
-void Assembler::C_ADDI16SP(int32_t imm) noexcept {
-    BISCUIT_ASSERT(imm != 0);
-    BISCUIT_ASSERT(imm >= -512 && imm <= 496);
-    BISCUIT_ASSERT(imm % 16 == 0);
-
-    // clang-format off
-    const auto uimm = static_cast<uint32_t>(imm);
-    const auto new_imm = ((uimm & 0x020) >> 3) |
-                         ((uimm & 0x180) >> 4) |
-                         ((uimm & 0x040) >> 1) |
-                         ((uimm & 0x010) << 2) |
-                         ((uimm & 0x200) << 3);
-    // clang-format on
-
-    m_buffer.Emit16(0x6000U | new_imm | (x2.Index() << 7) | 0b01U);
-}
-
-void Assembler::C_AND(GPR rd, GPR rs) noexcept {
-    EmitCompressedRegArith(m_buffer, 0b100011, rd, 0b11, rs, 0b01);
-}
-
-void Assembler::C_ANDI(GPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rd));
-
-    constexpr auto base = 0x8801U;
-    const auto shift_enc = ((imm & 0b11111) << 2) | ((imm & 0b100000) << 7);
-    const auto reg = CompressedRegTo3BitEncoding(rd);
-
-    m_buffer.Emit16(base | shift_enc | (reg << 7));
-}
-
-void Assembler::C_BEQZ(GPR rs, int32_t offset) noexcept {
-    EmitCompressedBranch(m_buffer, 0b110, offset, rs, 0b01);
-}
-
-void Assembler::C_BEQZ(GPR rs, Label* label) noexcept {
-    const auto address = LinkAndGetOffset(label);
-    C_BEQZ(rs, static_cast<int32_t>(address));
-}
-
-void Assembler::C_BNEZ(GPR rs, int32_t offset) noexcept {
-    EmitCompressedBranch(m_buffer, 0b111, offset, rs, 0b01);
-}
-
-void Assembler::C_BNEZ(GPR rs, Label* label) noexcept {
-    const auto address = LinkAndGetOffset(label);
-    C_BNEZ(rs, static_cast<int32_t>(address));
-}
-
-void Assembler::C_EBREAK() noexcept {
-    m_buffer.Emit16(0x9002);
-}
-
-void Assembler::C_FLD(FPR rd, uint32_t imm, GPR rs) noexcept {
-    BISCUIT_ASSERT(imm <= 248);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    EmitCompressedLoad(m_buffer, 0b001, imm, rs, rd, 0b00);
-}
-
-void Assembler::C_FLDSP(FPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 504);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x018) << 2) |
-                         ((imm & 0x1C0) >> 4) |
-                         ((imm & 0x020) << 7);
-    // clang-format on
-
-    m_buffer.Emit16(0x2002U | (rd.Index() << 7) | new_imm);
-}
-
-void Assembler::C_FLW(FPR rd, uint32_t imm, GPR rs) noexcept {
-    BISCUIT_ASSERT(imm <= 124);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    imm &= 0x7C;
-    const auto new_imm = ((imm & 0b0100) << 5) | (imm & 0x78);
-    EmitCompressedLoad(m_buffer, 0b011, new_imm, rs, rd, 0b00);
-}
-
-void Assembler::C_FLWSP(FPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 252);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x020) << 7) |
-                         ((imm & 0x0C0) >> 4) |
-                         ((imm & 0x01C) << 2);
-    // clang-format on
-
-    m_buffer.Emit16(0x6002U | (rd.Index() << 7) | new_imm);
-}
-
-void Assembler::C_FSD(FPR rs2, uint32_t imm, GPR rs1) noexcept {
-    BISCUIT_ASSERT(imm <= 248);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    EmitCompressedStore(m_buffer, 0b101, imm, rs1, rs2, 0b00);
-}
-
-void Assembler::C_FSDSP(FPR rs, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 504);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x038) << 7) |
-                         ((imm & 0x1C0) << 1);
-    // clang-format on
-
-    m_buffer.Emit16(0xA002U | (rs.Index() << 2) | new_imm);
-}
-
-void Assembler::C_J(Label* label) noexcept {
-    const auto address = LinkAndGetOffset(label);
-    C_J(static_cast<int32_t>(address));
-}
-
-void Assembler::C_J(int32_t offset) noexcept {
-    EmitCompressedJump(m_buffer, 0b101, offset, 0b01);
-}
-
-void Assembler::C_JAL(Label* label) noexcept {
-    const auto address = LinkAndGetOffset(label);
-    C_JAL(static_cast<int32_t>(address));
-}
-
-void Assembler::C_JAL(int32_t offset) noexcept {
-    EmitCompressedJump(m_buffer, 0b001, offset, 0b01);
-}
-
-void Assembler::C_FSW(FPR rs2, uint32_t imm, GPR rs1) noexcept {
-    imm &= 0x7C;
-    const auto new_imm = ((imm & 0b0100) << 5) | (imm & 0x78);
-    EmitCompressedStore(m_buffer, 0b111, new_imm, rs1, rs2, 0b00);
-}
-
-void Assembler::C_FSWSP(FPR rs, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 252);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x0C0) << 1) |
-                         ((imm & 0x03C) << 7);
-    // clang-format on
-
-    m_buffer.Emit16(0xE002U | (rs.Index() << 2) | new_imm);
-}
-
-void Assembler::C_JALR(GPR rs) noexcept {
-    BISCUIT_ASSERT(rs != x0);
-    m_buffer.Emit16(0x9002 | (rs.Index() << 7));
-}
-
-void Assembler::C_JR(GPR rs) noexcept {
-    BISCUIT_ASSERT(rs != x0);
-    m_buffer.Emit16(0x8002 | (rs.Index() << 7));
-}
-
-void Assembler::C_LD(GPR rd, uint32_t imm, GPR rs) noexcept {
-    BISCUIT_ASSERT(imm <= 248);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    EmitCompressedLoad(m_buffer, 0b011, imm, rs, rd, 0b00);
-}
-
-void Assembler::C_LDSP(GPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(rd != x0);
-    BISCUIT_ASSERT(imm <= 504);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x018) << 2) |
-                         ((imm & 0x1C0) >> 4) |
-                         ((imm & 0x020) << 7);
-    // clang-format on
-
-    m_buffer.Emit16(0x6002U | (rd.Index() << 7) | new_imm);
-}
-
-void Assembler::C_LI(GPR rd, int32_t imm) noexcept {
-    BISCUIT_ASSERT(IsValidSigned6BitImm(imm));
-    EmitCompressedImmediate(m_buffer, 0b010, static_cast<uint32_t>(imm), rd, 0b01);
-}
-
-void Assembler::C_LQ(GPR rd, uint32_t imm, GPR rs) noexcept {
-    BISCUIT_ASSERT(imm <= 496);
-    BISCUIT_ASSERT(imm % 16 == 0);
-
-    imm &= 0x1F0;
-    const auto new_imm = ((imm & 0x100) >> 5) | (imm & 0xF0);
-    EmitCompressedLoad(m_buffer, 0b001, new_imm, rs, rd, 0b00);
-}
-
-void Assembler::C_LQSP(GPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(rd != x0);
-    BISCUIT_ASSERT(imm <= 1008);
-    BISCUIT_ASSERT(imm % 16 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x020) << 7) |
-                         ((imm & 0x010) << 2) |
-                         ((imm & 0x3C0) >> 4);
-    // clang-format on
-
-    m_buffer.Emit16(0x2002U | (rd.Index() << 7) | new_imm);
-}
-
-void Assembler::C_LUI(GPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm != 0);
-    BISCUIT_ASSERT(rd != x0 && rd != x2);
-
-    const auto new_imm = (imm & 0x3F000) >> 12;
-    EmitCompressedImmediate(m_buffer, 0b011, new_imm, rd, 0b01);
-}
-
-void Assembler::C_LW(GPR rd, uint32_t imm, GPR rs) noexcept {
-    BISCUIT_ASSERT(imm <= 124);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    imm &= 0x7C;
-    const auto new_imm = ((imm & 0b0100) << 5) | (imm & 0x78);
-    EmitCompressedLoad(m_buffer, 0b010, new_imm, rs, rd, 0b00);
-}
-
-void Assembler::C_LWSP(GPR rd, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(rd != x0);
-    BISCUIT_ASSERT(imm <= 252);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x020) << 7) |
-                         ((imm & 0x0C0) >> 4) |
-                         ((imm & 0x01C) << 2);
-    // clang-format on
-
-    m_buffer.Emit16(0x4002U | (rd.Index() << 7) | new_imm);
-}
-
-void Assembler::C_MV(GPR rd, GPR rs) noexcept {
-    BISCUIT_ASSERT(rd != x0);
-    BISCUIT_ASSERT(rs != x0);
-    m_buffer.Emit16(0x8002 | (rd.Index() << 7) | (rs.Index() << 2));
-}
-
-void Assembler::C_NOP() noexcept {
-    m_buffer.Emit16(1);
-}
-
-void Assembler::C_OR(GPR rd, GPR rs) noexcept {
-    EmitCompressedRegArith(m_buffer, 0b100011, rd, 0b10, rs, 0b01);
-}
-
-void Assembler::C_SD(GPR rs2, uint32_t imm, GPR rs1) noexcept {
-    BISCUIT_ASSERT(imm <= 248);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    EmitCompressedLoad(m_buffer, 0b111, imm, rs1, rs2, 0b00);
-}
-
-void Assembler::C_SDSP(GPR rs, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 504);
-    BISCUIT_ASSERT(imm % 8 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x038) << 7) |
-                         ((imm & 0x1C0) << 1);
-    // clang-format on
-
-    m_buffer.Emit16(0xE002U | (rs.Index() << 2) | new_imm);
-}
-
-void Assembler::C_SLLI(GPR rd, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(rd != x0);
-    BISCUIT_ASSERT(IsValidCompressedShiftAmount(shift));
-
-    // RV128C encodes a 64-bit shift with an encoding of 0.
-    if (shift == 64) {
-        shift = 0;
-    }
-
-    const auto shift_enc = ((shift & 0b11111) << 2) | ((shift & 0b100000) << 7);
-    m_buffer.Emit16(0x0002U | shift_enc | (rd.Index() << 7));
-}
-
-void Assembler::C_SQ(GPR rs2, uint32_t imm, GPR rs1) noexcept {
-    BISCUIT_ASSERT(imm <= 496);
-    BISCUIT_ASSERT(imm % 16 == 0);
-
-    imm &= 0x1F0;
-    const auto new_imm = ((imm & 0x100) >> 5) | (imm & 0xF0);
-    EmitCompressedStore(m_buffer, 0b101, new_imm, rs1, rs2, 0b00);
-}
-
-void Assembler::C_SQSP(GPR rs, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 1008);
-    BISCUIT_ASSERT(imm % 16 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x3C0) << 1) |
-                         ((imm & 0x030) << 7);
-    // clang-format on
-
-    m_buffer.Emit16(0xA002U | (rs.Index() << 2) | new_imm);
-}
-
-void Assembler::C_SRAI(GPR rd, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rd));
-    BISCUIT_ASSERT(IsValidCompressedShiftAmount(shift));
-
-    // RV128C encodes a 64-bit shift with an encoding of 0.
-    if (shift == 64) {
-        shift = 0;
-    }
-
-    constexpr auto base = 0x8401U;
-    const auto shift_enc = ((shift & 0b11111) << 2) | ((shift & 0b100000) << 7);
-    const auto reg = CompressedRegTo3BitEncoding(rd);
-
-    m_buffer.Emit16(base | shift_enc | (reg << 7));
-}
-
-void Assembler::C_SRLI(GPR rd, uint32_t shift) noexcept {
-    BISCUIT_ASSERT(IsValid3BitCompressedReg(rd));
-    BISCUIT_ASSERT(IsValidCompressedShiftAmount(shift));
-
-    // RV128C encodes a 64-bit shift with an encoding of 0.
-    if (shift == 64) {
-        shift = 0;
-    }
-
-    constexpr auto base = 0x8001U;
-    const auto shift_enc = ((shift & 0b11111) << 2) | ((shift & 0b100000) << 7);
-    const auto reg = CompressedRegTo3BitEncoding(rd);
-
-    m_buffer.Emit16(base | shift_enc | (reg << 7));
-}
-
-void Assembler::C_SUB(GPR rd, GPR rs) noexcept {
-    EmitCompressedRegArith(m_buffer, 0b100011, rd, 0b00, rs, 0b01);
-}
-
-void Assembler::C_SUBW(GPR rd, GPR rs) noexcept {
-    EmitCompressedRegArith(m_buffer, 0b100111, rd, 0b00, rs, 0b01);
-}
-
-void Assembler::C_SW(GPR rs2, uint32_t imm, GPR rs1) noexcept {
-    BISCUIT_ASSERT(imm <= 124);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    imm &= 0x7C;
-    const auto new_imm = ((imm & 0b0100) << 5) | (imm & 0x78);
-    EmitCompressedStore(m_buffer, 0b110, new_imm, rs1, rs2, 0b00);
-}
-
-void Assembler::C_SWSP(GPR rs, uint32_t imm) noexcept {
-    BISCUIT_ASSERT(imm <= 252);
-    BISCUIT_ASSERT(imm % 4 == 0);
-
-    // clang-format off
-    const auto new_imm = ((imm & 0x0C0) << 1) |
-                         ((imm & 0x03C) << 7);
-    // clang-format on
-
-    m_buffer.Emit16(0xC002U | (rs.Index() << 2) | new_imm);
-}
-
-void Assembler::C_UNDEF() noexcept {
-    m_buffer.Emit16(0);
-}
-
-void Assembler::C_XOR(GPR rd, GPR rs) noexcept {
-    EmitCompressedRegArith(m_buffer, 0b100011, rd, 0b01, rs, 0b01);
 }
 
 // Cache Management Operation Extension Instructions
@@ -2199,6 +1221,7 @@ void Assembler::HLV_BU(GPR rd, GPR rs) noexcept {
 }
 
 void Assembler::HLV_D(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0110110, x0, rs, 0b100, rd, 0b1110011);
 }
 
@@ -2215,6 +1238,7 @@ void Assembler::HLV_W(GPR rd, GPR rs) noexcept {
 }
 
 void Assembler::HLV_WU(GPR rd, GPR rs) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0110100, x1, rs, 0b100, rd, 0b1110011);
 }
 
@@ -2231,6 +1255,7 @@ void Assembler::HSV_B(GPR rs2, GPR rs1) noexcept {
 }
 
 void Assembler::HSV_D(GPR rs2, GPR rs1) noexcept {
+    BISCUIT_ASSERT(IsRV64(m_features));
     EmitRType(m_buffer, 0b0110111, rs2, rs1, 0b100, x0, 0b1110011);
 }
 
