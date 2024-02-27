@@ -37,7 +37,7 @@ If you are looking at a recompiler which you can use with minimal effort to run 
 
 Here are some projects with the same goals as dynarmic:
 
-* [ChocolArm64 from Ryujinx](https://github.com/Ryujinx/Ryujinx/tree/master/ChocolArm64) - ARMv8 recompiler on top of RyuJIT
+* [ARMeilleure from Ryujinx](https://github.com/Ryujinx/Ryujinx/tree/master/src/ARMeilleure) - ARMv8 recompiler on top of RyuJIT
 * [Unicorn](https://www.unicorn-engine.org/) - Recompiling multi-architecture CPU emulator, based on QEMU
 * [SkyEye](http://skyeye.sourceforge.net) - Cached interpreter for ARM
 
